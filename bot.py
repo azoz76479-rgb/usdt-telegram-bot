@@ -62,7 +62,6 @@ LANGUAGES = {
         'deposit_btn': "💳 إيداع الرصيد",
         'daily_bonus_btn': "🎁 المكافأة اليومية",
         'support_btn': "🆘 الدعم الفني",
-        'refresh_btn': "🔄 تحديث البيانات",
         'back_btn': "🔙 رجوع",
     },
     'en': {
@@ -73,7 +72,6 @@ LANGUAGES = {
         'deposit_btn': "💳 Deposit Balance",
         'daily_bonus_btn': "🎁 Daily Bonus",
         'support_btn': "🆘 Technical Support",
-        'refresh_btn': "🔄 Refresh Data",
         'back_btn': "🔙 Back",
     }
 }
@@ -104,7 +102,20 @@ def get_user(user_id):
                 'vip_level': 0, 'attempts': 3, 'total_earnings': 0.75,
                 'total_deposits': 0.0, 'registration_date': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
                 'last_activity': datetime.now().strftime('%Y-%m-%d %H:%M:%S'), 'last_mining_date': None,
-                'games_played_today': 0, 'has_deposit': 0, 'language': 'ar'
+                'games_played_today': 0, 'has_deposit': 0, 'language': 'ar',
+                'referral_tracking': {},
+                'joined_via_referral': False,
+                'referral_notification_sent': False,
+                'referral_source': None,
+                'first_game_played': False,
+                'referral_verified': False,
+                'has_received_referral': False,
+                'start_count': 0,
+                # 🔥 الحقول الجديدة لمنع التكرار
+                'has_been_referred': False,
+                'active_referral_source': None,
+                'first_visit_date': None,
+                'referral_attempts': {}
             }
             users_collection.insert_one(new_user)
             return new_user
@@ -121,26 +132,165 @@ def update_user(user_id, **kwargs):
         print(f"❌ Error updating user: {e}")
         return False
 
+def track_referral_attempt(user_id, referrer_id):
+    """🎯 تتبع محاولات الدخول على الروابط"""
+    try:
+        user = get_user(user_id)
+        if not user:
+            return False
+            
+        referral_attempts = user.get('referral_attempts', {})
+        attempt_key = f"attempt_{referrer_id}"
+        
+        current_attempts = referral_attempts.get(attempt_key, 0)
+        
+        if current_attempts >= 1:
+            print(f"🚫 Too many attempts: {user_id} -> {referrer_id} (attempts: {current_attempts})")
+            return False
+            
+        referral_attempts[attempt_key] = current_attempts + 1
+        update_user(user_id, referral_attempts=referral_attempts)
+        
+        return True
+        
+    except Exception as e:
+        print(f"❌ Track attempt error: {e}")
+        return False
+
 def handle_referral_system(message):
+    """🎯 النظام النهائي - منع التكرار 100%"""
     try:
         user_id = message.from_user.id
         command_parts = message.text.split()
+        
         if len(command_parts) > 1 and command_parts[1].startswith('ref'):
             try:
                 referrer_id = int(command_parts[1][3:])
-                if referrer_id != user_id:
-                    referrer = get_user(referrer_id)
-                    if referrer:
-                        update_user(referrer_id,
-                            balance=referrer['balance'] + 0.50,
-                            total_earnings=referrer['total_earnings'] + 0.50,
-                            referral_count=referrer['referral_count'] + 1,
-                            new_referrals=referrer['new_referrals'] + 1
-                        )
-            except ValueError:
-                pass
+                
+                # 🔒 منع الإحالة الذاتية
+                if referrer_id == user_id:
+                    print(f"🚫 Self-referral blocked: {user_id}")
+                    return
+                
+                # 🔥 التحقق من محاولات الدخول
+                if not track_referral_attempt(user_id, referrer_id):
+                    print(f"🚫 Too many attempts blocked: {user_id} -> {referrer_id}")
+                    return
+                
+                referrer = get_user(referrer_id)
+                current_user = get_user(user_id)
+                
+                if not referrer or not current_user:
+                    return
+                
+                # 🔥 التحقق الحاسم: إذا المستخدم مسجل مسبقاً في نظام الإحالات
+                if current_user.get('has_been_referred', False):
+                    print(f"🚫 User {user_id} already in referral system - BLOCKED")
+                    return
+                
+                # 🔒 منع الإحالات المكررة لنفس المُحيل
+                user_referral_key = f"ref_{user_id}"
+                referral_tracking = referrer.get('referral_tracking', {})
+                
+                if referral_tracking.get(user_referral_key):
+                    print(f"🚫 Duplicate referral blocked: {referrer_id} -> {user_id}")
+                    return
+                
+                # ✅ التسجيل النهائي (مرة واحدة فقط في العمر)
+                referral_tracking[user_referral_key] = {
+                    'date': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                    'new_user_id': user_id,
+                    'status': 'pending_verification',
+                    'unique_id': f"{user_id}_{referrer_id}_{int(time.time())}"
+                }
+                
+                update_user(user_id, 
+                          has_been_referred=True,
+                          active_referral_source=referrer_id,
+                          first_visit_date=datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                          referral_source=referrer_id,
+                          joined_via_referral=True,
+                          start_count=current_user.get('start_count', 0) + 1)
+                
+                update_user(referrer_id, referral_tracking=referral_tracking)
+                
+                print(f"✅ PERMANENT referral registered: {referrer_id} -> {user_id}")
+                
+            except Exception as e:
+                print(f"❌ Referral error: {e}")
     except Exception as e:
-        print(f"❌ Referral error: {e}")
+        print(f"❌ Referral system error: {e}")
+
+def verify_referral_on_first_game(user_id):
+    """🎯 التحقق من الإحالة عند أول لعبة"""
+    try:
+        user = get_user(user_id)
+        if not user or not user.get('joined_via_referral') or not user.get('referral_source'):
+            return False
+        
+        referrer_id = user['referral_source']
+        referrer = get_user(referrer_id)
+        
+        if not referrer:
+            return False
+        
+        # 🔐 الشروط النهائية لمنح المكافأة
+        user_reg_date = datetime.strptime(user['registration_date'], '%Y-%m-%d %H:%M:%S')
+        time_since_reg = datetime.now() - user_reg_date
+        
+        can_get_bonus = (
+            user.get('games_played_today', 0) >= 1 and
+            time_since_reg.total_seconds() > 60 and
+            not user.get('has_received_referral', False) and
+            not user.get('referral_verified', False)
+        )
+        
+        if not can_get_bonus:
+            return False
+        
+        referral_key = f"ref_{user_id}"
+        referral_tracking = referrer.get('referral_tracking', {})
+        
+        if referral_tracking.get(referral_key, {}).get('status') == 'pending_verification':
+            # ✅ منح المكافأة للمُحيل
+            update_user(referrer_id,
+                balance=round(referrer['balance'] + 0.50, 2),
+                total_earnings=round(referrer['total_earnings'] + 0.50, 2),
+                referral_count=referrer['referral_count'] + 1,
+                new_referrals=referrer['new_referrals'] + 1
+            )
+            
+            # ✅ تحديث حالة المستخدم
+            update_user(user_id,
+                referral_verified=True,
+                referral_notification_sent=True,
+                has_received_referral=True
+            )
+            
+            # تحديث حالة الإحالة
+            referral_tracking[referral_key]['status'] = 'verified'
+            referral_tracking[referral_key]['verified_date'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            update_user(referrer_id, referral_tracking=referral_tracking)
+            
+            # 📩 إرسال إشعار
+            try:
+                lang = get_user_language(referrer_id)
+                if lang == 'ar':
+                    msg = "🎉 إحالة جديدة مؤكدة! +0.50 USDT"
+                else:
+                    msg = "🎉 New verified referral! +0.50 USDT"
+                bot.send_message(referrer_id, msg)
+            except:
+                pass
+            
+            print(f"✅ Referral bonus given: {referrer_id} -> {user_id}")
+            return True
+        
+        return False
+        
+    except Exception as e:
+        print(f"❌ Referral verification error: {e}")
+        return False
 
 def get_remaining_attempts(user):
     base_attempts = VIP_LEVELS[user['vip_level']]['max_attempts']
@@ -219,6 +369,8 @@ def claim_daily_bonus(user_id):
 def show_main_menu(chat_id, message_id=None, user_id=None):
     try:
         if not user_id: return False
+        
+        # 🔄 تحديث تلقائي للبيانات
         user_data = get_user(user_id)
         if not user_data: return False
         
@@ -247,7 +399,7 @@ def show_main_menu(chat_id, message_id=None, user_id=None):
 <b>🏆 المستوى والصلاحيات:</b>
 ├ {vip_name}
 ├ 🎯 <b>محاولات اليوم:</b> {remaining_attempts}/{total_attempts}
-└ 👥 <b>الإحالات:</b> {user_data['referral_count']} مستخدم
+└ 💼 <b>الإحالات:</b> انقر لعرض التفاصيل
 
 ⏰ <b>المكافأة اليومية:</b> {get_mining_time_left(user_id)}
 🔐 <b>حالة السحب:</b> {status_text}
@@ -267,7 +419,7 @@ def show_main_menu(chat_id, message_id=None, user_id=None):
 <b>🏆 Level & Privileges:</b>
 ├ {vip_name}
 ├ 🎯 <b>Daily Attempts:</b> {remaining_attempts}/{total_attempts}
-└ 👥 <b>Referrals:</b> {user_data['referral_count']} users
+└ 💼 <b>Referrals:</b> Click for details
 
 ⏰ <b>Daily Bonus:</b> {get_mining_time_left(user_id)}
 🔐 <b>Withdrawal Status:</b> {status_text}
@@ -288,8 +440,7 @@ def show_main_menu(chat_id, message_id=None, user_id=None):
             InlineKeyboardButton(t(user_id, 'daily_bonus_btn'), callback_data="daily_bonus")
         )
         keyboard.add(
-            InlineKeyboardButton(t(user_id, 'support_btn'), url="https://t.me/Trust_wallet_Support_4"),
-            InlineKeyboardButton(t(user_id, 'refresh_btn'), callback_data="refresh_profile")
+            InlineKeyboardButton(t(user_id, 'support_btn'), url="https://t.me/Trust_wallet_Support_4")
         )
         
         if lang == 'ar':
@@ -311,8 +462,14 @@ def show_main_menu(chat_id, message_id=None, user_id=None):
 def handle_start(message):
     try:
         user_id = message.from_user.id
+        
         handle_referral_system(message)
-        update_user(user_id, first_name=message.from_user.first_name or "", username=message.from_user.username or "", last_activity=datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+        
+        update_user(user_id, 
+                   first_name=message.from_user.first_name or "", 
+                   username=message.from_user.username or "", 
+                   last_activity=datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+        
         show_main_menu(message.chat.id, user_id=user_id)
     except Exception as e:
         print(f"❌ Start error: {e}")
@@ -384,7 +541,12 @@ def play_slot(call):
             bot.answer_callback_query(call.id, "❌ لا توجد محاولات متبقية اليوم!" if get_user_language(call.from_user.id) == 'ar' else "❌ No attempts left today!", show_alert=True)
             return
         
-        update_user(call.from_user.id, games_played_today=user.get('games_played_today', 0) + 1)
+        games_played_before = user.get('games_played_today', 0)
+        update_user(call.from_user.id, games_played_today=games_played_before + 1)
+        
+        # 🔐 إذا كانت هذه أول لعبة، تحقق من الإحالة
+        if games_played_before == 0:
+            verify_referral_on_first_game(call.from_user.id)
         
         symbols = ["🍒", "🍋", "🍊", "🍇", "🔔", "💎"]
         result = [random.choice(symbols) for _ in range(3)]
@@ -446,7 +608,12 @@ def play_dice(call):
             bot.answer_callback_query(call.id, "❌ لا توجد محاولات متبقية اليوم!" if get_user_language(call.from_user.id) == 'ar' else "❌ No attempts left today!", show_alert=True)
             return
         
-        update_user(call.from_user.id, games_played_today=user.get('games_played_today', 0) + 1)
+        games_played_before = user.get('games_played_today', 0)
+        update_user(call.from_user.id, games_played_today=games_played_before + 1)
+        
+        # 🔐 إذا كانت هذه أول لعبة، تحقق من الإحالة
+        if games_played_before == 0:
+            verify_referral_on_first_game(call.from_user.id)
         
         dice1 = random.randint(1, 6)
         dice2 = random.randint(1, 6)
@@ -518,11 +685,6 @@ def handle_language_change(call):
 def back_to_profile(call):
     show_main_menu(call.message.chat.id, call.message.message_id, call.from_user.id)
 
-@bot.callback_query_handler(func=lambda call: call.data == "refresh_profile")
-def refresh_profile(call):
-    show_main_menu(call.message.chat.id, call.message.message_id, call.from_user.id)
-    bot.answer_callback_query(call.id, "✅ تم التحديث" if get_user_language(call.from_user.id) == 'ar' else "✅ Updated")
-
 @bot.callback_query_handler(func=lambda call: call.data == "daily_bonus")
 def handle_daily_bonus(call):
     success, message = claim_daily_bonus(call.from_user.id)
@@ -531,38 +693,47 @@ def handle_daily_bonus(call):
         time.sleep(1)
         show_main_menu(call.message.chat.id, call.message.message_id, call.from_user.id)
 
-# 👥 نظام الإحالات
+# 👥 نظام الإحالات المعدل
 @bot.callback_query_handler(func=lambda call: call.data == "referral")
 def handle_referral(call):
     try:
         user_id = call.from_user.id
+        user = get_user(user_id)
         referral_link = f"https://t.me/Usdt_Mini1Bot?start=ref{user_id}"
         
         lang = get_user_language(user_id)
         
-        referral_text = f"""<b>نظام الإحالات</b>
+        referral_text = f"""<b>👥 نظام الإحالات</b>
 
-<b>رابط الدعوة الخاص بك:</b>
+📊 <b>إحصائياتك:</b>
+├ 👤 <b>الإحالات المؤكدة:</b> {user['referral_count']} مستخدم
+├ 💰 <b>أرباح الإحالات:</b> {user['referral_count'] * 0.50:.2f} USDT
+└ 🎯 <b>المطلوب للسحب:</b> {user['new_referrals']}/25 إحالة
+
+<b>🔗 رابط الدعوة الخاص بك:</b>
 <code>{referral_link}</code>
 
-<b>مزايا الإحالات:</b>
-• 0.50 USDT مكافأة فورية لكل إحالة
+<b>🎁 مزايا الإحالات:</b>
+• 0.50 USDT مكافأة فورية لكل إحالة مؤكدة
 • +1 محاولة ألعاب يومية لكل إحالة  
-• فرصة ربح مضاعفة
-• وصول أسرع لشروط السحب (25 إحالة مطلوبة)
+• وصول أسرع لشروط السحب
 
-<b>شارك الرابط مع أصدقائك واكسب المزيد!</b>""" if lang == 'ar' else f"""<b>Referral System</b>
+<b>📤 شارك الرابط مع أصدقائك واكسب المزيد!</b>""" if lang == 'ar' else f"""<b>👥 Referral System</b>
 
-<b>Your referral link:</b>
+📊 <b>Your Statistics:</b>
+├ 👤 <b>Confirmed Referrals:</b> {user['referral_count']} users
+├ 💰 <b>Referral Earnings:</b> {user['referral_count'] * 0.50:.2f} USDT
+└ 🎯 <b>Required for Withdrawal:</b> {user['new_referrals']}/25 referrals
+
+<b>🔗 Your referral link:</b>
 <code>{referral_link}</code>
 
-<b>Referral benefits:</b>
-• 0.50 USDT instant bonus per referral
+<b>🎁 Referral benefits:</b>
+• 0.50 USDT instant bonus per confirmed referral
 • +1 daily game attempt per referral  
-• Double profit opportunity
-• Faster access to withdrawal conditions (25 referrals required)
+• Faster access to withdrawal conditions
 
-<b>Share the link with your friends and earn more!</b>"""
+<b>📤 Share the link with your friends and earn more!</b>"""
         
         keyboard = InlineKeyboardMarkup()
         if lang == 'ar':
@@ -984,179 +1155,6 @@ Thank you for your trust! 🌟"""
     except Exception as e:
         print(f"❌ Deposit request error: {e}")
 
-# 🎨 نظام إرسال العروض المصممة مع أزرار
-@bot.message_handler(commands=['send_design'])
-def handle_send_design(message):
-    """أمر للإدمن لإرسال عروض مصممة للجميع"""
-    if not is_admin(message.from_user.id):
-        bot.reply_to(message, "❌ <b>ليس لديك صلاحية!</b>")
-        return
-    
-    try:
-        # طلب تأكيد الإرسال للجميع
-        confirm_keyboard = InlineKeyboardMarkup()
-        confirm_keyboard.add(
-            InlineKeyboardButton("✅ نعم، أرسل للجميع", callback_data="design_confirm_all"),
-            InlineKeyboardButton("📱 اختبار للإدمن فقط", callback_data="design_test_only")
-        )
-        
-        total_users = users_collection.count_documents({})
-        
-        bot.reply_to(message, 
-                    f"🖼️ <b>نظام إرسال التصاميم</b>\n\n"
-                    f"👥 <b>عدد المستخدمين:</b> {total_users}\n\n"
-                    f"📝 <b>اختر طريقة الإرسال:</b>\n"
-                    f"• ✅ للجميع - يرسل لجميع المستخدمين\n"
-                    f"• 📱 اختبار - يعرض لك المعاينة فقط\n\n"
-                    f"🖼️ <b>بعد الموافقة أرسل الصورة</b>",
-                    reply_markup=confirm_keyboard)
-        
-    except Exception as e:
-        bot.reply_to(message, f"❌ <b>خطأ:</b> {e}")
-
-@bot.callback_query_handler(func=lambda call: call.data == "design_confirm_all")
-def handle_design_confirm_all(call):
-    """تأكيد الإرسال للجميع"""
-    try:
-        bot.answer_callback_query(call.id, "📤 جاهز لاستقبال الصورة للإرسال الجماعي...")
-        bot.edit_message_text("🖼️ <b>الإرسال للجميع ✓</b>\n\nأرسل الصورة الآن...", 
-                            call.message.chat.id, 
-                            call.message.message_id)
-        
-        # تسجيل أن الإرسال للجميع
-        bot.register_next_step_handler(call.message, process_design_image, send_to_all=True)
-        
-    except Exception as e:
-        bot.reply_to(call.message, f"❌ <b>خطأ:</b> {e}")
-
-@bot.callback_query_handler(func=lambda call: call.data == "design_test_only")
-def handle_design_test_only(call):
-    """الإرسال للإدمن فقط (معاينة)"""
-    try:
-        bot.answer_callback_query(call.id, "📱 وضع المعاينة - للإدمن فقط")
-        bot.edit_message_text("🖼️ <b>وضع المعاينة ✓</b>\n\nأرسل الصورة للعرض الخاص بك...", 
-                            call.message.chat.id, 
-                            call.message.message_id)
-        
-        # تسجيل أن الإرسال للإدمن فقط
-        bot.register_next_step_handler(call.message, process_design_image, send_to_all=False)
-        
-    except Exception as e:
-        bot.reply_to(call.message, f"❌ <b>خطأ:</b> {e}")
-
-def process_design_image(message, send_to_all=False):
-    """معالجة الصورة المرسلة من الإدمن"""
-    try:
-        if not message.photo:
-            bot.reply_to(message, "❌ <b>لم ترسل صورة! أعد استخدام الأمر /send_design</b>")
-            return
-        
-        # حفظ file_id للصورة
-        file_id = message.photo[-1].file_id
-        
-        bot.reply_to(message, "📝 <b>الآن أرسل النص التحتي للصورة</b>")
-        bot.register_next_step_handler(message, process_design_text, file_id, send_to_all)
-        
-    except Exception as e:
-        bot.reply_to(message, f"❌ <b>خطأ في معالجة الصورة:</b> {e}")
-
-def process_design_text(message, file_id, send_to_all=False):
-    """معالجة النص وإرسال العرض"""
-    try:
-        caption_text = message.text or "عرض حصري! 🎯"
-        
-        # إنشاء الأزرار
-        markup = InlineKeyboardMarkup()
-        btn_deposit = InlineKeyboardButton("💳 إيداع الآن", url="https://t.me/Trust_wallet_Support_4")
-        btn_support = InlineKeyboardButton("📞 دعم فني", url="https://t.me/Trust_wallet_Support_4")
-        markup.add(btn_deposit, btn_support)
-        
-        if send_to_all:
-            # 🔥 الإرسال للجميع
-            all_users = list(users_collection.find({}, {'user_id': 1}))
-            total_users = len(all_users)
-            successful_sends = 0
-            
-            # إرسال للجميع
-            for user in all_users:
-                try:
-                    bot.send_photo(
-                        user['user_id'],
-                        photo=file_id,
-                        caption=caption_text,
-                        reply_markup=markup,
-                        parse_mode="HTML"
-                    )
-                    successful_sends += 1
-                    time.sleep(0.1)  # تجنب rate limits
-                except Exception as e:
-                    print(f"❌ فشل الإرسال للمستخدم {user['user_id']}: {e}")
-            
-            # تقرير النتيجة للإدمن
-            success_rate = (successful_sends / total_users) * 100 if total_users > 0 else 0
-            report_msg = f"""🎉 <b>تم الإرسال الجماعي بنجاح!</b>
-
-📊 <b>الإحصائيات:</b>
-👥 <b>إجمالي المستخدمين:</b> {total_users}
-✅ <b>تم الإرسال بنجاح:</b> {successful_sends}
-❌ <b>فشل في الإرسال:</b> {total_users - successful_sends}
-📈 <b>نسبة النجاح:</b> {success_rate:.1f}%"""
-
-            bot.send_message(message.chat.id, report_msg)
-            
-        else:
-            # 📱 الإرسال للإدمن فقط (معاينة)
-            bot.send_photo(
-                message.chat.id,
-                photo=file_id,
-                caption=caption_text,
-                reply_markup=markup,
-                parse_mode="HTML"
-            )
-            bot.reply_to(message, "✅ <b>تم عرض المعاينة بنجاح!</b>\n\nاستخدم /send_design للإرسال للجميع")
-        
-    except Exception as e:
-        bot.reply_to(message, f"❌ <b>خطأ في إرسال العرض:</b> {e}")
-
-# 🎁 أمر جاهز للعروض السريعة
-@bot.message_handler(commands=['quick_offer'])
-def handle_quick_offer(message):
-    """عرض سريع جاهز للإيداع"""
-    if not is_admin(message.from_user.id):
-        bot.reply_to(message, "❌ <b>ليس لديك صلاحية!</b>")
-        return
-    
-    try:
-        # الأزرار
-        markup = InlineKeyboardMarkup()
-        btn_deposit = InlineKeyboardButton("💳 إيداع سريع", url="https://t.me/Trust_wallet_Support_4")
-        btn_support = InlineKeyboardButton("📞 استفسار", url="https://t.me/Trust_wallet_Support_4")
-        markup.add(btn_deposit, btn_support)
-        
-        # النص الجاهز
-        offer_text = """
-🎯 <b>عرض الإيداع الحصري!</b>
-
-💰 <b>مميزات العرض:</b>
-• minimum إيداع 10$ فقط
-• مكافأة 5% على أول إيداع
-• معالجة فورية
-• دعم فني 24/7
-
-🚀 <b>للإيداع اضغط على الزر بالأسفل 👇</b>
-        """
-        
-        # إرسال العرض
-        bot.send_message(
-            message.chat.id,
-            offer_text,
-            reply_markup=markup,
-            parse_mode="HTML"
-        )
-        
-    except Exception as e:
-        bot.reply_to(message, f"❌ <b>خطأ:</b> {e}")
-
 # 🛠️ الأوامر الإدارية
 @bot.message_handler(commands=['quickadd'])
 def handle_quickadd(message):
@@ -1181,446 +1179,78 @@ def handle_quickadd(message):
     except Exception as e:
         bot.reply_to(message, f"❌ <b>خطأ:</b> {e}")
 
-@bot.message_handler(commands=['setbalance'])
-def handle_setbalance(message):
-    if not is_admin(message.from_user.id):
-        bot.reply_to(message, "❌ <b>ليس لديك صلاحية!</b>")
-        return
+# أوامر التتبع والاختبار
+@bot.message_handler(commands=['testref'])
+def test_referral_system(message):
+    """🎯 اختبار نظام الإحالات"""
     try:
-        parts = message.text.split()
-        if len(parts) != 3:
-            bot.reply_to(message, "📝 <b>استخدام:</b> <code>/setbalance [user_id] [amount]</code>")
-            return
-        target_user_id, amount = parts[1], float(parts[2])
-        user = get_user(target_user_id)
-        if not user:
-            bot.reply_to(message, "❌ <b>المستخدم غير موجود!</b>")
-            return
-        if update_user(target_user_id, balance=amount):
-            bot.reply_to(message, f"✅ <b>تم تعيين رصيد المستخدم {target_user_id} إلى {amount} USDT</b>")
-        else:
-            bot.reply_to(message, "❌ <b>فشل في تعيين الرصيد!</b>")
+        user_id = message.from_user.id
+        user = get_user(user_id)
+        
+        test_info = f"""
+🔍 <b>اختبار نظام الإحالات</b>
+
+👤 <b>المستخدم:</b> {user_id}
+🔗 <b>رابط إحالتك:</b> 
+<code>https://t.me/Usdt_Mini1Bot?start=ref{user_id}</code>
+
+📊 <b>حالة الإحالة:</b>
+• has_been_referred: {user.get('has_been_referred', False)}
+• active_referral_source: {user.get('active_referral_source')}
+• referral_attempts: {len(user.get('referral_attempts', {}))}
+• joined_via_referral: {user.get('joined_via_referral', False)}
+
+🎯 <b>للتجربة:</b>
+1. أرسل الرابط لشخص
+2. ليحاول يدخل عليه مرتين
+3. شوف إذا انحسبت مرة واحدة فقط
+        """
+        
+        bot.reply_to(message, test_info)
+        
     except Exception as e:
-        bot.reply_to(message, f"❌ <b>خطأ:</b> {e}")
+        bot.reply_to(message, f"❌ خطأ في الاختبار: {e}")
 
-@bot.message_handler(commands=['setreferrals'])
-def handle_setreferrals(message):
+@bot.message_handler(commands=['refdebug'])
+def referral_debug(message):
+    """🐛 تتبع الإحالات للمشرف"""
     if not is_admin(message.from_user.id):
-        bot.reply_to(message, "❌ <b>ليس لديك صلاحية!</b>")
-        return
-    try:
-        parts = message.text.split()
-        if len(parts) != 3:
-            bot.reply_to(message, "📝 <b>استخدام:</b> <code>/setreferrals [user_id] [count]</code>")
-            return
-        target_user_id, count = parts[1], int(parts[2])
-        user = get_user(target_user_id)
-        if not user:
-            bot.reply_to(message, "❌ <b>المستخدم غير موجود!</b>")
-            return
-        if update_user(target_user_id, referral_count=count, new_referrals=count):
-            bot.reply_to(message, f"✅ <b>تم تعيين إحالات المستخدم {target_user_id} إلى {count}</b>")
-        else:
-            bot.reply_to(message, "❌ <b>فشل في تعيين الإحالات!</b>")
-    except Exception as e:
-        bot.reply_to(message, f"❌ <b>خطأ:</b> {e}")
-
-@bot.message_handler(commands=['addreferral'])
-def handle_addreferral(message):
-    if not is_admin(message.from_user.id):
-        bot.reply_to(message, "❌ <b>ليس لديك صلاحية!</b>")
-        return
-    try:
-        parts = message.text.split()
-        if len(parts) != 2:
-            bot.reply_to(message, "📝 <b>استخدام:</b> <code>/addreferral [user_id]</code>")
-            return
-        target_user_id = parts[1]
-        user = get_user(target_user_id)
-        if not user:
-            bot.reply_to(message, "❌ <b>المستخدم غير موجود!</b>")
-            return
-        
-        new_ref_count = user['referral_count'] + 1
-        new_ref_new = user.get('new_referrals', 0) + 1
-        new_balance = user['balance'] + 0.50
-        
-        if update_user(target_user_id, 
-                      referral_count=new_ref_count,
-                      new_referrals=new_ref_new,
-                      balance=new_balance,
-                      total_earnings=user['total_earnings'] + 0.50):
-            bot.reply_to(message, f"✅ <b>تم إضافة إحالة للمستخدم {target_user_id}</b>\n👥 <b>الإحالات الجديدة:</b> {new_ref_new}\n💰 <b>المكافأة:</b> 0.50 USDT")
-        else:
-            bot.reply_to(message, "❌ <b>فشل في إضافة الإحالة!</b>")
-    except Exception as e:
-        bot.reply_to(message, f"❌ <b>خطأ:</b> {e}")
-
-@bot.message_handler(commands=['setattempts'])
-def handle_setattempts(message):
-    if not is_admin(message.from_user.id):
-        bot.reply_to(message, "❌ <b>ليس لديك صلاحية!</b>")
-        return
-    try:
-        parts = message.text.split()
-        if len(parts) != 3:
-            bot.reply_to(message, "📝 <b>استخدام:</b> <code>/setattempts [user_id] [attempts]</code>")
-            return
-        target_user_id, attempts = parts[1], int(parts[2])
-        user = get_user(target_user_id)
-        if not user:
-            bot.reply_to(message, "❌ <b>المستخدم غير موجود!</b>")
-            return
-        if update_user(target_user_id, attempts=attempts):
-            bot.reply_to(message, f"✅ <b>تم تعيين محاولات المستخدم {target_user_id} إلى {attempts}</b>")
-        else:
-            bot.reply_to(message, "❌ <b>فشل في تعيين المحاولات!</b>")
-    except Exception as e:
-        bot.reply_to(message, f"❌ <b>خطأ:</b> {e}")
-
-@bot.message_handler(commands=['resetattempts'])
-def handle_resetattempts(message):
-    if not is_admin(message.from_user.id):
-        bot.reply_to(message, "❌ <b>ليس لديك صلاحية!</b>")
-        return
-    try:
-        parts = message.text.split()
-        if len(parts) != 2:
-            bot.reply_to(message, "📝 <b>استخدام:</b> <code>/resetattempts [user_id]</code>")
-            return
-        target_user_id = parts[1]
-        user = get_user(target_user_id)
-        if not user:
-            bot.reply_to(message, "❌ <b>المستخدم غير موجود!</b>")
-            return
-        if update_user(target_user_id, games_played_today=0):
-            bot.reply_to(message, f"✅ <b>تم إعادة تعيين محاولات اليوم للمستخدم {target_user_id}</b>")
-        else:
-            bot.reply_to(message, "❌ <b>فشل في إعادة تعيين المحاولات!</b>")
-    except Exception as e:
-        bot.reply_to(message, f"❌ <b>خطأ:</b> {e}")
-
-@bot.message_handler(commands=['addattempts'])
-def handle_addattempts(message):
-    if not is_admin(message.from_user.id):
-        bot.reply_to(message, "❌ <b>ليس لديك صلاحية!</b>")
-        return
-    try:
-        parts = message.text.split()
-        if len(parts) != 3:
-            bot.reply_to(message, "📝 <b>استخدام:</b> <code>/addattempts [user_id] [count]</code>")
-            return
-        target_user_id, count = parts[1], int(parts[2])
-        user = get_user(target_user_id)
-        if not user:
-            bot.reply_to(message, "❌ <b>المستخدم غير موجود!</b>")
-            return
-        
-        new_attempts = user['attempts'] + count
-        if update_user(target_user_id, attempts=new_attempts):
-            bot.reply_to(message, f"✅ <b>تم إضافة {count} محاولة للمستخدم {target_user_id}</b>\n🎯 <b>المحاولات الجديدة:</b> {new_attempts}")
-        else:
-            bot.reply_to(message, "❌ <b>فشل في إضافة المحاولات!</b>")
-    except Exception as e:
-        bot.reply_to(message, f"❌ <b>خطأ:</b> {e}")
-
-@bot.message_handler(commands=['setdeposits'])
-def handle_setdeposits(message):
-    if not is_admin(message.from_user.id):
-        bot.reply_to(message, "❌ <b>ليس لديك صلاحية!</b>")
-        return
-    try:
-        parts = message.text.split()
-        if len(parts) != 3:
-            bot.reply_to(message, "📝 <b>استخدام:</b> <code>/setdeposits [user_id] [amount]</code>")
-            return
-        target_user_id, amount = parts[1], float(parts[2])
-        user = get_user(target_user_id)
-        if not user:
-            bot.reply_to(message, "❌ <b>المستخدم غير موجود!</b>")
-            return
-        if update_user(target_user_id, total_deposits=amount):
-            bot.reply_to(message, f"✅ <b>تم تعيين إجمالي إيداعات المستخدم {target_user_id} إلى {amount} USDT</b>")
-        else:
-            bot.reply_to(message, "❌ <b>فشل في تعيين الإيداعات!</b>")
-    except Exception as e:
-        bot.reply_to(message, f"❌ <b>خطأ:</b> {e}")
-
-@bot.message_handler(commands=['adddeposit'])
-def handle_adddeposit(message):
-    if not is_admin(message.from_user.id):
-        bot.reply_to(message, "❌ <b>ليس لديك صلاحية!</b>")
-        return
-    try:
-        parts = message.text.split()
-        if len(parts) != 3:
-            bot.reply_to(message, "📝 <b>استخدام:</b> <code>/adddeposit [user_id] [amount]</code>")
-            return
-        target_user_id, amount = parts[1], float(parts[2])
-        user = get_user(target_user_id)
-        if not user:
-            bot.reply_to(message, "❌ <b>المستخدم غير موجود!</b>")
-            return
-        
-        new_deposits = user['total_deposits'] + amount
-        new_balance = user['balance'] + amount
-        if update_user(target_user_id, 
-                      total_deposits=new_deposits,
-                      balance=new_balance,
-                      has_deposit=1):
-            bot.reply_to(message, f"✅ <b>تم إضافة إيداع للمستخدم {target_user_id}</b>\n💰 <b>المبلغ:</b> {amount} USDT\n💵 <b>الرصيد الجديد:</b> {new_balance:.2f} USDT\n✅ <b>تم تفعيل الإيداع</b>")
-        else:
-            bot.reply_to(message, "❌ <b>فشل في إضافة الإيداع!</b>")
-    except Exception as e:
-        bot.reply_to(message, f"❌ <b>خطأ:</b> {e}")
-
-@bot.message_handler(commands=['setvip'])
-def handle_setvip(message):
-    if not is_admin(message.from_user.id):
-        bot.reply_to(message, "❌ <b>ليس لديك صلاحية!</b>")
-        return
-    try:
-        parts = message.text.split()
-        if len(parts) != 3:
-            bot.reply_to(message, "📝 <b>استخدام:</b> <code>/setvip [user_id] [level]</code>\n\n🏆 <b>مستويات VIP:</b>\n0 - مبتدئ\n1 - برونز\n2 - سيلفر\n3 - جولد")
-            return
-        target_user_id, level = parts[1], int(parts[2])
-        
-        if level not in VIP_LEVELS:
-            bot.reply_to(message, "❌ <b>مستوى VIP غير صحيح!</b>\n\n🏆 <b>المستويات المتاحة:</b>\n0 - مبتدئ\n1 - برونز\n2 - سيلفر\n3 - جولد")
-            return
-            
-        user = get_user(target_user_id)
-        if not user:
-            bot.reply_to(message, "❌ <b>المستخدم غير موجود!</b>")
-            return
-        
-        vip_name = VIP_LEVELS[level]['name_ar']
-        if update_user(target_user_id, vip_level=level):
-            bot.reply_to(message, f"✅ <b>تم ترقية المستخدم {target_user_id} إلى مستوى {vip_name}</b>")
-        else:
-            bot.reply_to(message, "❌ <b>فشل في تعيين مستوى VIP!</b>")
-    except Exception as e:
-        bot.reply_to(message, f"❌ <b>خطأ:</b> {e}")
-
-@bot.message_handler(commands=['userinfo'])
-def handle_userinfo(message):
-    if not is_admin(message.from_user.id):
-        bot.reply_to(message, "❌ <b>ليس لديك صلاحية!</b>")
-        return
-    try:
-        parts = message.text.split()
-        if len(parts) != 2:
-            bot.reply_to(message, "📝 <b>استخدام:</b> <code>/userinfo [user_id]</code>")
-            return
-        target_user_id = parts[1]
-        user = get_user(target_user_id)
-        if not user:
-            bot.reply_to(message, "❌ <b>المستخدم غير موجود!</b>")
-            return
-        
-        vip_info = VIP_LEVELS[user['vip_level']]
-        remaining_attempts, total_attempts, extra_attempts = get_remaining_attempts(user)
-        days_registered, days_remaining = get_membership_days(target_user_id)
-        
-        info_msg = f"""👤 <b>معلومات المستخدم:</b>
-
-🆔 <b>المعرف:</b> {user['user_id']}
-👤 <b>الاسم:</b> {user['first_name'] or 'غير معروف'}
-📛 <b>اليوزر:</b> @{user['username'] or 'لا يوجد'}
-💰 <b>الرصيد:</b> {user['balance']:.2f} USDT
-👥 <b>الإحالات:</b> {user['referral_count']}
-📈 <b>الإحالات الجديدة:</b> {user['new_referrals']}/25
-📅 <b>مدة العضوية:</b> {days_registered}/10 أيام
-🏆 <b>مستوى VIP:</b> {vip_info['name_ar']}
-🎯 <b>المحاولات:</b> {user['attempts']} (متبقي: {remaining_attempts}/{total_attempts})
-🎮 <b>ألعاب اليوم:</b> {user.get('games_played_today', 0)}
-💎 <b>إجمالي الأرباح:</b> {user['total_earnings']:.2f} USDT
-💳 <b>إجمالي الإيداعات:</b> {user['total_deposits']:.2f} USDT
-✅ <b>إيداع مفعل:</b> {'نعم' if user.get('has_deposit', 0) else 'لا'}
-📅 <b>تاريخ التسجيل:</b> {user['registration_date']}
-🕒 <b>آخر نشاط:</b> {user['last_activity']}"""
-        
-        bot.reply_to(message, info_msg)
-    except Exception as e:
-        bot.reply_to(message, f"❌ <b>خطأ:</b> {e}")
-
-@bot.message_handler(commands=['listusers'])
-def handle_listusers(message):
-    if not is_admin(message.from_user.id):
-        bot.reply_to(message, "❌ <b>ليس لديك صلاحية!</b>")
-        return
-    try:
-        users = list(users_collection.find().limit(50))
-        if not users:
-            bot.reply_to(message, "❌ <b>لا يوجد مستخدمين!</b>")
-            return
-        
-        users_list = "📋 <b>آخر 50 مستخدم:</b>\n\n"
-        for i, user in enumerate(users, 1):
-            users_list += f"{i}. {user['first_name'] or 'غير معروف'} - <code>{user['user_id']}</code>\n"
-        
-        bot.reply_to(message, users_list)
-    except Exception as e:
-        bot.reply_to(message, f"❌ <b>خطأ:</b> {e}")
-
-@bot.message_handler(commands=['stats'])
-def handle_stats(message):
-    if not is_admin(message.from_user.id):
-        bot.reply_to(message, "❌ <b>ليس لديك صلاحية!</b>")
-        return
-    try:
-        total_users = users_collection.count_documents({})
-        pipeline = [{"$group": {"_id": None, "total_balance": {"$sum": "$balance"}, "total_earnings": {"$sum": "$total_earnings"}, "total_deposits": {"$sum": "$total_deposits"}, "total_referrals": {"$sum": "$referral_count"}}}]
-        stats = list(users_collection.aggregate(pipeline))
-        
-        if stats:
-            stats_data = stats[0]
-            total_balance = stats_data['total_balance']
-            total_earnings = stats_data['total_earnings']
-            total_deposits = stats_data['total_deposits']
-            total_referrals = stats_data['total_referrals']
-        else:
-            total_balance = total_earnings = total_deposits = total_referrals = 0
-        
-        vip_stats = list(users_collection.aggregate([{"$group": {"_id": "$vip_level", "count": {"$sum": 1}}}]))
-        
-        stats_msg = f"""📊 <b>إحصائيات البوت:</b>
-
-👥 <b>إجمالي المستخدمين:</b> {total_users}
-💰 <b>إجمالي الرصيد:</b> {total_balance:.2f} USDT
-💎 <b>إجمالي الأرباح:</b> {total_earnings:.2f} USDT
-💳 <b>إجمالي الإيداعات:</b> {total_deposits:.2f} USDT
-👥 <b>إجمالي الإحالات:</b> {total_referrals}
-
-<b>🏆 توزيع مستويات VIP:</b>"""
-        for stat in vip_stats:
-            vip_name = VIP_LEVELS[stat['_id']]['name_ar']
-            stats_msg += f"\n{vip_name}: {stat['count']} مستخدم"
-        
-        bot.reply_to(message, stats_msg)
-    except Exception as e:
-        bot.reply_to(message, f"❌ <b>خطأ:</b> {e}")
-
-# 📢 نظام الإرسال الجماعي المتكامل
-@bot.message_handler(commands=['broadcast'])
-def handle_broadcast(message):
-    """إرسال رسالة جماعية لجميع المستخدمين"""
-    if not is_admin(message.from_user.id):
-        bot.reply_to(message, "❌ <b>ليس لديك صلاحية!</b>")
         return
     
     try:
-        # الحصول على نص الرسالة
-        command_parts = message.text.split(' ', 1)
-        if len(command_parts) < 2:
-            bot.reply_to(message, "📝 <b>استخدام:</b> <code>/broadcast [رسالتك هنا]</code>\n\n💡 <b>مثال:</b>\n<code>/broadcast مرحبا بالجميع! 🎉</code>")
+        parts = message.text.split()
+        if len(parts) == 2:
+            target_id = int(parts[1])
+        else:
+            target_id = message.from_user.id
+        
+        user = get_user(target_id)
+        if not user:
+            bot.reply_to(message, "❌ المستخدم غير موجود")
             return
         
-        broadcast_text = command_parts[1]
+        debug_info = f"""
+🐛 <b>تتبع الإحالات للمستخدم {target_id}</b>
+
+📋 <b>المعلومات الأساسية:</b>
+• has_been_referred: {user.get('has_been_referred', False)}
+• active_referral_source: {user.get('active_referral_source')}
+• joined_via_referral: {user.get('joined_via_referral', False)}
+• referral_source: {user.get('referral_source')}
+
+📊 <b>محاولات الدخول:</b>
+{user.get('referral_attempts', {})}
+
+🕒 <b>أول زيارة:</b> {user.get('first_visit_date', 'N/A')}
+
+🔍 <b>للتجربة:</b>
+لو هذا المستخدم دخل على رابط إحالة مرة ثانية، رح يظهر هنا
+        """
         
-        # تأكيد الإرسال
-        confirm_keyboard = InlineKeyboardMarkup()
-        confirm_keyboard.add(
-            InlineKeyboardButton("✅ نعم، أرسل للجميع", callback_data=f"broadcast_confirm:{broadcast_text}"),
-            InlineKeyboardButton("❌ إلغاء", callback_data="broadcast_cancel")
-        )
-        
-        # الحصول على عدد المستخدمين
-        total_users = users_collection.count_documents({})
-        
-        bot.reply_to(message, 
-                    f"📢 <b>تأكيد الإرسال الجماعي</b>\n\n"
-                    f"📝 <b>الرسالة:</b>\n{broadcast_text}\n\n"
-                    f"👥 <b>عدد المستخدمين:</b> {total_users}\n"
-                    f"⚠️ <b>هذا الإجراء لا يمكن التراجع عنه</b>",
-                    reply_markup=confirm_keyboard)
+        bot.reply_to(message, debug_info)
         
     except Exception as e:
-        bot.reply_to(message, f"❌ <b>خطأ:</b> {e}")
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith('broadcast_confirm:'))
-def handle_broadcast_confirm(call):
-    """معالجة تأكيد الإرسال الجماعي"""
-    try:
-        broadcast_text = call.data.split(':', 1)[1]
-        bot.answer_callback_query(call.id, "🔄 بدء الإرسال الجماعي...")
-        
-        # الحصول على جميع المستخدمين
-        all_users = list(users_collection.find({}, {'user_id': 1}))
-        total_users = len(all_users)
-        successful_sends = 0
-        failed_sends = 0
-        
-        # تحديث الرسالة الأصلية
-        progress_msg = bot.edit_message_text(
-            f"📤 <b>جاري الإرسال الجماعي...</b>\n\n"
-            f"👥 <b>إجمالي المستخدمين:</b> {total_users}\n"
-            f"✅ <b>تم الإرسال:</b> 0\n"
-            f"❌ <b>فشل:</b> 0\n"
-            f"⏳ <b>متبقي:</b> {total_users}",
-            call.message.chat.id,
-            call.message.message_id
-        )
-        
-        # إرسال للجميع
-        for i, user in enumerate(all_users):
-            try:
-                user_id = user['user_id']
-                bot.send_message(user_id, broadcast_text)
-                successful_sends += 1
-                
-                # تحديث التقدم كل 10 رسائل
-                if (i + 1) % 10 == 0 or (i + 1) == total_users:
-                    try:
-                        bot.edit_message_text(
-                            f"📤 <b>جاري الإرسال الجماعي...</b>\n\n"
-                            f"👥 <b>إجمالي المستخدمين:</b> {total_users}\n"
-                            f"✅ <b>تم الإرسال:</b> {successful_sends}\n"
-                            f"❌ <b>فشل:</b> {failed_sends}\n"
-                            f"⏳ <b>متبقي:</b> {total_users - (i + 1)}",
-                            call.message.chat.id,
-                            call.message.message_id
-                        )
-                    except:
-                        pass  # تجاهل أخطاء التحديث
-                
-                time.sleep(0.2)  # تجنب rate limits
-                
-            except Exception as e:
-                failed_sends += 1
-                print(f"❌ فشل الإرسال للمستخدم {user['user_id']}: {e}")
-        
-        # النتيجة النهائية
-        success_rate = (successful_sends / total_users) * 100 if total_users > 0 else 0
-        
-        bot.edit_message_text(
-            f"🎉 <b>تم الانتهاء من الإرسال الجماعي!</b>\n\n"
-            f"📊 <b>الإحصائيات النهائية:</b>\n"
-            f"👥 <b>إجمالي المستخدمين:</b> {total_users}\n"
-            f"✅ <b>تم الإرسال بنجاح:</b> {successful_sends}\n"
-            f"❌ <b>فشل في الإرسال:</b> {failed_sends}\n"
-            f"📈 <b>نسبة النجاح:</b> {success_rate:.1f}%",
-            call.message.chat.id,
-            call.message.message_id
-        )
-        
-    except Exception as e:
-        bot.answer_callback_query(call.id, f"❌ خطأ: {e}")
-        try:
-            bot.edit_message_text(f"❌ <b>فشل في الإرسال الجماعي:</b> {e}", 
-                                call.message.chat.id, 
-                                call.message.message_id)
-        except:
-            pass
-
-@bot.callback_query_handler(func=lambda call: call.data == "broadcast_cancel")
-def handle_broadcast_cancel(call):
-    """إلغاء الإرسال الجماعي"""
-    bot.answer_callback_query(call.id, "❌ تم إلغاء الإرسال الجماعي")
-    bot.edit_message_text("❌ <b>تم إلغاء الإرسال الجماعي</b>", 
-                         call.message.chat.id, 
-                         call.message.message_id)
+        bot.reply_to(message, f"❌ خطأ: {e}")
 
 # =============================================
 # 🔧 نظام السيرفر والويب هوك
@@ -1630,7 +1260,6 @@ app = Flask(__name__)
 
 @app.route('/webhook', methods=['POST'])
 def webhook():
-    """استقبال الرسائل من تليجرام"""
     try:
         json_data = request.get_json()
         update = telebot.types.Update.de_json(json_data)
@@ -1654,7 +1283,6 @@ def ping():
 
 @app.route('/set_webhook', methods=['GET'])
 def set_webhook_manual():
-    """تعيين الويب هوك يدوياً"""
     try:
         bot.remove_webhook()
         time.sleep(2)
@@ -1668,7 +1296,6 @@ def set_webhook_manual():
 def test():
     return "✅ البوت شغال تمام! - " + datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-# 🔄 نظام الإبقاء على الخدمة نشطة - محسّن
 def keep_alive():
     while True:
         try:
@@ -1679,15 +1306,13 @@ def keep_alive():
                 print(f"⚠️ Keep-alive status: {response.status_code}")
         except Exception as e:
             print(f"❌ Keep-alive failed: {e}")
-        time.sleep(300)  # ⬅️ كل 5 دقائق فقط
+        time.sleep(300)
 
-# 🔄 إعداد الويب هوك تلقائياً - محسّن
 def setup_webhook():
-    """إعداد الويب هوك تلقائياً مع إعادة المحاولة"""
     max_retries = 3
     for attempt in range(max_retries):
         try:
-            time.sleep(15)  # انتظر 15 ثانية للتأكد من تشغيل السيرفر
+            time.sleep(15)
             print(f"🔄 جاري تعيين الويب هوك (المحاولة {attempt + 1})...")
             
             bot.remove_webhook()
@@ -1696,7 +1321,6 @@ def setup_webhook():
             webhook_url = "https://usdt-telegram-bot-1-z7op.onrender.com/webhook"
             result = bot.set_webhook(url=webhook_url)
             
-            # تحقق من الويب هوك
             webhook_info = bot.get_webhook_info()
             print(f"✅ تم تعيين الويب هوك: {webhook_url}")
             print(f"📊 معلومات الويب هوك: {webhook_info}")
@@ -1705,17 +1329,15 @@ def setup_webhook():
         except Exception as e:
             print(f"❌ فشل تعيين الويب هوك (المحاولة {attempt + 1}): {e}")
             if attempt < max_retries - 1:
-                time.sleep(10)  # انتظر قبل إعادة المحاولة
+                time.sleep(10)
     return False
 
 if __name__ == '__main__':
     print("🚀 بدء تشغيل البوت...")
     
-    # تشغيل نظام الإبقاء النشط
     keep_thread = threading.Thread(target=keep_alive, daemon=True)
     keep_thread.start()
     
-    # محاولة إعداد الويب هوك تلقائياً
     webhook_success = setup_webhook()
     if not webhook_success:
         print("⚠️ تشغيل بدون ويب هوك - استخدام polling")
@@ -1723,6 +1345,5 @@ if __name__ == '__main__':
         time.sleep(2)
         bot.polling(none_stop=True)
     else:
-        # تشغيل الخادم
         port = int(os.environ.get("PORT", 8080))
         app.run(host='0.0.0.0', port=port, debug=False)
