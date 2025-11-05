@@ -30,7 +30,6 @@ try:
     client = MongoClient(MONGO_URI)
     db = client['usdt_bot']
     users_collection = db['users']
-    referral_history_collection = db['referral_history']  # 🔐 مجموعة جديدة
     print("✅ Connected to MongoDB")
 except Exception as e:
     print(f"❌ MongoDB error: {e}")
@@ -112,7 +111,7 @@ def get_user(user_id):
                 'referral_source': None,
                 'first_game_played': False,
                 'referral_verified': False,
-                'is_suspicious': False
+                'has_received_referral': False  # 🔐 الحقل الجديد
             }
             users_collection.insert_one(new_user)
             return new_user
@@ -129,32 +128,8 @@ def update_user(user_id, **kwargs):
         print(f"❌ Error updating user: {e}")
         return False
 
-def has_user_joined_via_any_referral(user_id):
-    """🔐 التحقق إذا كان المستخدم دخل عبر أي رابط إحالة سابقاً"""
-    try:
-        existing_entry = referral_history_collection.find_one({
-            'joined_user_id': str(user_id)
-        })
-        return existing_entry is not None
-    except Exception as e:
-        print(f"❌ Error checking referral history: {e}")
-        return False
-
-def add_to_referral_history(referrer_id, joined_user_id):
-    """🔐 إضافة سجل دائم للإحالة"""
-    try:
-        referral_history_collection.insert_one({
-            'referrer_id': str(referrer_id),
-            'joined_user_id': str(joined_user_id),
-            'join_date': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-            'status': 'registered'
-        })
-        return True
-    except Exception as e:
-        print(f"❌ Error adding to referral history: {e}")
-        return False
-
 def handle_referral_system(message):
+    """🎯 نظام الإحالات المعدل - حل نهائي"""
     try:
         user_id = message.from_user.id
         command_parts = message.text.split()
@@ -163,42 +138,44 @@ def handle_referral_system(message):
             try:
                 referrer_id = int(command_parts[1][3:])
                 
+                # 🔒 منع الإحالة الذاتية
                 if referrer_id == user_id:
-                    print(f"🚫 Self-referral blocked: {user_id}")
                     return
                 
                 referrer = get_user(referrer_id)
                 current_user = get_user(user_id)
                 
                 if not referrer or not current_user:
-                    print(f"❌ User not found: referrer={referrer_id}, current={user_id}")
                     return
                 
-                # 🔐 التحقق الحاسم: هل دخل هذا المستخدم عبر أي رابط إحالة سابقاً؟
-                if has_user_joined_via_any_referral(user_id):
-                    print(f"🚫 User {user_id} already joined via referral before - BLOCKED")
+                # 🔐 الشرط الحاسم: منع الإحالة إذا كان المستخدم قد استقبل إحالة من قبل
+                if current_user.get('has_received_referral', False):
+                    print(f"🚫 User {user_id} already received referral before - BLOCKED")
                     return
                 
+                # 🔐 منع الإحالة إذا كان المستخدم لديه أي نشاط سابق
                 user_reg_date = datetime.strptime(current_user['registration_date'], '%Y-%m-%d %H:%M:%S')
                 time_since_reg = datetime.now() - user_reg_date
                 
-                is_eligible = (
-                    time_since_reg.total_seconds() < 600 and
-                    abs(current_user['balance'] - 0.75) < 0.01 and
-                    current_user.get('games_played_today', 0) == 0 and
-                    not current_user.get('referral_notification_sent', False)
+                has_previous_activity = (
+                    current_user.get('games_played_today', 0) > 0 or
+                    current_user.get('total_deposits', 0) > 0 or
+                    current_user.get('balance', 0) > 0.75 or
+                    current_user.get('referral_count', 0) > 0 or
+                    time_since_reg.total_seconds() > 300  # أكثر من 5 دقائق
                 )
                 
-                if not is_eligible:
-                    print(f"🚫 Not eligible for referral: {user_id}")
+                if has_previous_activity:
+                    print(f"🚫 User {user_id} has previous activity - BLOCKED")
                     return
                 
-                # 🔒 إضافة سجل دائم في التاريخ
-                add_to_referral_history(referrer_id, user_id)
-                
+                # 🔒 منع الإحالات المكررة
                 referral_key = f"ref_{user_id}"
-                referral_tracking = referrer.get('referral_tracking', {})
+                if referrer.get('referral_tracking', {}).get(referral_key):
+                    return
                 
+                # ✅ تسجيل الإحالة كمعلقة
+                referral_tracking = referrer.get('referral_tracking', {})
                 referral_tracking[referral_key] = {
                     'date': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
                     'new_user_id': user_id,
@@ -208,17 +185,15 @@ def handle_referral_system(message):
                 update_user(referrer_id, referral_tracking=referral_tracking)
                 update_user(user_id, referral_source=referrer_id, joined_via_referral=True)
                 
-                print(f"✅ Referral registered for verification: {referrer_id} -> {user_id}")
+                print(f"✅ Referral pending: {referrer_id} -> {user_id}")
                 
-            except ValueError as ve:
-                print(f"❌ Invalid referral ID: {ve}")
             except Exception as e:
-                print(f"❌ Referral processing error: {e}")
+                print(f"❌ Referral error: {e}")
     except Exception as e:
         print(f"❌ Referral system error: {e}")
 
-def verify_referral_after_activity(user_id):
-    """🔐 التحقق من الإحالة بعد النشاط"""
+def verify_referral_on_first_game(user_id):
+    """🎯 التحقق من الإحالة عند أول لعبة"""
     try:
         user = get_user(user_id)
         if not user or not user.get('joined_via_referral') or not user.get('referral_source'):
@@ -230,55 +205,56 @@ def verify_referral_after_activity(user_id):
         if not referrer:
             return False
         
+        # 🔐 الشروط النهائية لمنح المكافأة
         user_reg_date = datetime.strptime(user['registration_date'], '%Y-%m-%d %H:%M:%S')
         time_since_reg = datetime.now() - user_reg_date
         
-        is_verified = (
+        can_get_bonus = (
             user.get('games_played_today', 0) >= 1 and
-            time_since_reg.total_seconds() > 300 and
+            time_since_reg.total_seconds() > 60 and  # مضى أكثر من دقيقة
+            not user.get('has_received_referral', False) and
             not user.get('referral_verified', False)
         )
         
-        if not is_verified:
+        if not can_get_bonus:
             return False
         
         referral_key = f"ref_{user_id}"
         referral_tracking = referrer.get('referral_tracking', {})
         
-        ref_data = referral_tracking.get(referral_key, {})
-        if ref_data.get('status') == 'pending_verification':
-            referral_tracking[referral_key]['status'] = 'verified'
-            referral_tracking[referral_key]['verified_date'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-            
+        if referral_tracking.get(referral_key, {}).get('status') == 'pending_verification':
+            # ✅ منح المكافأة للمُحيل
             update_user(referrer_id,
                 balance=round(referrer['balance'] + 0.50, 2),
                 total_earnings=round(referrer['total_earnings'] + 0.50, 2),
                 referral_count=referrer['referral_count'] + 1,
-                new_referrals=referrer['new_referrals'] + 1,
-                referral_tracking=referral_tracking
+                new_referrals=referrer['new_referrals'] + 1
             )
             
-            update_user(user_id, referral_verified=True, referral_notification_sent=True)
+            # ✅ تحديث حالة المستخدم
+            update_user(user_id,
+                referral_verified=True,
+                referral_notification_sent=True,
+                has_received_referral=True  # 🔐 منع المستقبل
+            )
             
+            # تحديث حالة الإحالة
+            referral_tracking[referral_key]['status'] = 'verified'
+            referral_tracking[referral_key]['verified_date'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            update_user(referrer_id, referral_tracking=referral_tracking)
+            
+            # 📩 إرسال إشعار
             try:
                 lang = get_user_language(referrer_id)
                 if lang == 'ar':
-                    notification_msg = f"""🎉 <b>إحالة جديدة مؤكدة!</b>
-
-👤 مستخدم أكد حسابه باللعب
-💰 +0.50 USDT تمت إضافتها لرصيدك"""
+                    msg = "🎉 إحالة جديدة مؤكدة! +0.50 USDT"
                 else:
-                    notification_msg = f"""🎉 <b>New verified referral!</b>
-
-👤 User confirmed account by playing
-💰 +0.50 USDT added to your balance"""
-                
-                bot.send_message(referrer_id, notification_msg)
-                print(f"✅ Referral verified: {referrer_id} -> {user_id}")
-                
-            except Exception as notify_error:
-                print(f"⚠️ Cannot send notification: {notify_error}")
+                    msg = "🎉 New verified referral! +0.50 USDT"
+                bot.send_message(referrer_id, msg)
+            except:
+                pass
             
+            print(f"✅ Referral bonus given: {referrer_id} -> {user_id}")
             return True
         
         return False
@@ -392,7 +368,7 @@ def show_main_menu(chat_id, message_id=None, user_id=None):
 <b>🏆 المستوى والصلاحيات:</b>
 ├ {vip_name}
 ├ 🎯 <b>محاولات اليوم:</b> {remaining_attempts}/{total_attempts}
-└ 👥 <b>الإحالات:</b> {user_data['referral_count']} مستخدم
+└ 💼 <b>الإحالات:</b> انقر لعرض التفاصيل
 
 ⏰ <b>المكافأة اليومية:</b> {get_mining_time_left(user_id)}
 🔐 <b>حالة السحب:</b> {status_text}
@@ -412,7 +388,7 @@ def show_main_menu(chat_id, message_id=None, user_id=None):
 <b>🏆 Level & Privileges:</b>
 ├ {vip_name}
 ├ 🎯 <b>Daily Attempts:</b> {remaining_attempts}/{total_attempts}
-└ 👥 <b>Referrals:</b> {user_data['referral_count']} users
+└ 💼 <b>Referrals:</b> Click for details
 
 ⏰ <b>Daily Bonus:</b> {get_mining_time_left(user_id)}
 🔐 <b>Withdrawal Status:</b> {status_text}
@@ -538,9 +514,9 @@ def play_slot(call):
         games_played_before = user.get('games_played_today', 0)
         update_user(call.from_user.id, games_played_today=games_played_before + 1)
         
+        # 🔐 إذا كانت هذه أول لعبة، تحقق من الإحالة
         if games_played_before == 0:
-            update_user(call.from_user.id, first_game_played=True)
-            threading.Timer(300, verify_referral_after_activity, [call.from_user.id]).start()
+            verify_referral_on_first_game(call.from_user.id)
         
         symbols = ["🍒", "🍋", "🍊", "🍇", "🔔", "💎"]
         result = [random.choice(symbols) for _ in range(3)]
@@ -605,9 +581,9 @@ def play_dice(call):
         games_played_before = user.get('games_played_today', 0)
         update_user(call.from_user.id, games_played_today=games_played_before + 1)
         
+        # 🔐 إذا كانت هذه أول لعبة، تحقق من الإحالة
         if games_played_before == 0:
-            update_user(call.from_user.id, first_game_played=True)
-            threading.Timer(300, verify_referral_after_activity, [call.from_user.id]).start()
+            verify_referral_on_first_game(call.from_user.id)
         
         dice1 = random.randint(1, 6)
         dice2 = random.randint(1, 6)
@@ -692,7 +668,7 @@ def handle_daily_bonus(call):
         time.sleep(1)
         show_main_menu(call.message.chat.id, call.message.message_id, call.from_user.id)
 
-# 👥 نظام الإحالات
+# 👥 نظام الإحالات المعدل
 @bot.callback_query_handler(func=lambda call: call.data == "referral")
 def handle_referral(call):
     try:
@@ -702,29 +678,37 @@ def handle_referral(call):
         
         lang = get_user_language(user_id)
         
-        referral_text = f"""<b>نظام الإحالات</b>
+        referral_text = f"""<b>👥 نظام الإحالات</b>
 
-<b>رابط الدعوة الخاص بك:</b>
+📊 <b>إحصائياتك:</b>
+├ 👤 <b>الإحالات المؤكدة:</b> {user['referral_count']} مستخدم
+├ 💰 <b>أرباح الإحالات:</b> {user['referral_count'] * 0.50:.2f} USDT
+└ 🎯 <b>المطلوب للسحب:</b> {user['new_referrals']}/25 إحالة
+
+<b>🔗 رابط الدعوة الخاص بك:</b>
 <code>{referral_link}</code>
 
-<b>مزايا الإحالات:</b>
+<b>🎁 مزايا الإحالات:</b>
 • 0.50 USDT مكافأة فورية لكل إحالة مؤكدة
 • +1 محاولة ألعاب يومية لكل إحالة  
-• فرصة ربح مضاعفة
-• وصول أسرع لشروط السحب (25 إحالة مطلوبة)
+• وصول أسرع لشروط السحب
 
-<b>شارك الرابط مع أصدقائك واكسب المزيد!</b>""" if lang == 'ar' else f"""<b>Referral System</b>
+<b>📤 شارك الرابط مع أصدقائك واكسب المزيد!</b>""" if lang == 'ar' else f"""<b>👥 Referral System</b>
 
-<b>Your referral link:</b>
+📊 <b>Your Statistics:</b>
+├ 👤 <b>Confirmed Referrals:</b> {user['referral_count']} users
+├ 💰 <b>Referral Earnings:</b> {user['referral_count'] * 0.50:.2f} USDT
+└ 🎯 <b>Required for Withdrawal:</b> {user['new_referrals']}/25 referrals
+
+<b>🔗 Your referral link:</b>
 <code>{referral_link}</code>
 
-<b>Referral benefits:</b>
+<b>🎁 Referral benefits:</b>
 • 0.50 USDT instant bonus per confirmed referral
 • +1 daily game attempt per referral  
-• Double profit opportunity
-• Faster access to withdrawal conditions (25 referrals required)
+• Faster access to withdrawal conditions
 
-<b>Share the link with your friends and earn more!</b>"""
+<b>📤 Share the link with your friends and earn more!</b>"""
         
         keyboard = InlineKeyboardMarkup()
         if lang == 'ar':
@@ -737,6 +721,8 @@ def handle_referral(call):
         bot.edit_message_text(referral_text, call.message.chat.id, call.message.message_id, reply_markup=keyboard)
     except Exception as e:
         print(f"❌ Referral error: {e}")
+
+# ... (بقية الأكواد تبقى كما هي بدون تغيير)
 
 # 💎 نظام VIP
 @bot.callback_query_handler(func=lambda call: call.data == "vip_services")
@@ -1147,43 +1133,6 @@ Thank you for your trust! 🌟"""
         print(f"❌ Deposit request error: {e}")
 
 # 🛠️ الأوامر الإدارية
-@bot.message_handler(commands=['referral_stats'])
-def handle_referral_stats(message):
-    """📊 إحصائيات الإحالات (للمشرفين)"""
-    if not is_admin(message.from_user.id):
-        bot.reply_to(message, "❌ <b>ليس لديك صلاحية!</b>")
-        return
-    
-    try:
-        total_referrals = referral_history_collection.count_documents({})
-        total_users = users_collection.count_documents({})
-        
-        today = datetime.now().strftime('%Y-%m-%d')
-        today_referrals = referral_history_collection.count_documents({
-            'join_date': {'$regex': today}
-        })
-        
-        report = f"""📊 <b>إحصائيات نظام الإحالات</b>
-
-<b>الإحصائيات العامة:</b>
-• 📈 إجمالي الإحالات المسجلة: {total_referrals}
-• 👥 إجمالي المستخدمين: {total_users}
-• 📅 الإحالات اليوم: {today_referrals}
-
-<b>آخر 5 إحالات:</b>"""
-        
-        recent_referrals = list(referral_history_collection.find()
-                               .sort('join_date', -1)
-                               .limit(5))
-        
-        for ref in recent_referrals:
-            report += f"\n• {ref['referrer_id']} -> {ref['joined_user_id']} | {ref['join_date']}"
-        
-        bot.reply_to(message, report)
-        
-    except Exception as e:
-        bot.reply_to(message, f"❌ <b>خطأ:</b> {e}")
-
 @bot.message_handler(commands=['quickadd'])
 def handle_quickadd(message):
     if not is_admin(message.from_user.id):
