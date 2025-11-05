@@ -111,7 +111,8 @@ def get_user(user_id):
                 'referral_source': None,
                 'first_game_played': False,
                 'referral_verified': False,
-                'has_received_referral': False  # 🔐 الحقل الجديد
+                'has_received_referral': False,
+                'start_count': 0  # 🔥 إضافة جديدة لتتبع عدد مرات الدخول
             }
             users_collection.insert_one(new_user)
             return new_user
@@ -129,7 +130,7 @@ def update_user(user_id, **kwargs):
         return False
 
 def handle_referral_system(message):
-    """🎯 نظام الإحالات المعدل - حل نهائي"""
+    """🎯 نظام الإحالات المعدل - منع الإحالة الذاتية 100%"""
     try:
         user_id = message.from_user.id
         command_parts = message.text.split()
@@ -138,9 +139,16 @@ def handle_referral_system(message):
             try:
                 referrer_id = int(command_parts[1][3:])
                 
-                # 🔒 منع الإحالة الذاتية
+                # 🔥 الحل 100% - منع الإحالة الذاتية نهائياً
                 if referrer_id == user_id:
-                    return
+                    print(f"🚫 Self-referral blocked: {user_id}")
+                    # إشعار للمستخدم
+                    lang = get_user_language(user_id)
+                    if lang == 'ar':
+                        bot.send_message(user_id, "❌ <b>لا يمكنك تحويل نفسك!</b>\n\nرابط الإحالة مخصص لإرساله لأشخاص آخرين فقط.")
+                    else:
+                        bot.send_message(user_id, "❌ <b>You cannot refer yourself!</b>\n\nReferral link is for sending to other people only.")
+                    return  # وقف التنفيذ
                 
                 referrer = get_user(referrer_id)
                 current_user = get_user(user_id)
@@ -171,11 +179,12 @@ def handle_referral_system(message):
                 
                 # 🔒 منع الإحالات المكررة
                 referral_key = f"ref_{user_id}"
-                if referrer.get('referral_tracking', {}).get(referral_key):
+                referral_tracking = referrer.get('referral_tracking', {})
+                
+                if referral_tracking.get(referral_key):
                     return
                 
                 # ✅ تسجيل الإحالة كمعلقة
-                referral_tracking = referrer.get('referral_tracking', {})
                 referral_tracking[referral_key] = {
                     'date': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
                     'new_user_id': user_id,
@@ -183,7 +192,10 @@ def handle_referral_system(message):
                 }
                 
                 update_user(referrer_id, referral_tracking=referral_tracking)
-                update_user(user_id, referral_source=referrer_id, joined_via_referral=True)
+                update_user(user_id, 
+                          referral_source=referrer_id, 
+                          joined_via_referral=True,
+                          start_count=current_user.get('start_count', 0) + 1)
                 
                 print(f"✅ Referral pending: {referrer_id} -> {user_id}")
                 
@@ -722,8 +734,6 @@ def handle_referral(call):
     except Exception as e:
         print(f"❌ Referral error: {e}")
 
-# ... (بقية الأكواد تبقى كما هي بدون تغيير)
-
 # 💎 نظام VIP
 @bot.callback_query_handler(func=lambda call: call.data == "vip_services")
 def show_vip_services(call):
@@ -1156,7 +1166,7 @@ def handle_quickadd(message):
     except Exception as e:
         bot.reply_to(message, f"❌ <b>خطأ:</b> {e}")
 
-# ... (جميع الأوامر الإدارية الأخرى تبقى كما هي)
+# ... (بقية الأكواد الإدارية تبقى كما هي)
 
 # =============================================
 # 🔧 نظام السيرفر والويب هوك
