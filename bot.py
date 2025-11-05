@@ -1179,7 +1179,78 @@ def handle_quickadd(message):
     except Exception as e:
         bot.reply_to(message, f"❌ <b>خطأ:</b> {e}")
 
-# ... (بقية الأكواد الإدارية)
+# أوامر التتبع والاختبار
+@bot.message_handler(commands=['testref'])
+def test_referral_system(message):
+    """🎯 اختبار نظام الإحالات"""
+    try:
+        user_id = message.from_user.id
+        user = get_user(user_id)
+        
+        test_info = f"""
+🔍 <b>اختبار نظام الإحالات</b>
+
+👤 <b>المستخدم:</b> {user_id}
+🔗 <b>رابط إحالتك:</b> 
+<code>https://t.me/Usdt_Mini1Bot?start=ref{user_id}</code>
+
+📊 <b>حالة الإحالة:</b>
+• has_been_referred: {user.get('has_been_referred', False)}
+• active_referral_source: {user.get('active_referral_source')}
+• referral_attempts: {len(user.get('referral_attempts', {}))}
+• joined_via_referral: {user.get('joined_via_referral', False)}
+
+🎯 <b>للتجربة:</b>
+1. أرسل الرابط لشخص
+2. ليحاول يدخل عليه مرتين
+3. شوف إذا انحسبت مرة واحدة فقط
+        """
+        
+        bot.reply_to(message, test_info)
+        
+    except Exception as e:
+        bot.reply_to(message, f"❌ خطأ في الاختبار: {e}")
+
+@bot.message_handler(commands=['refdebug'])
+def referral_debug(message):
+    """🐛 تتبع الإحالات للمشرف"""
+    if not is_admin(message.from_user.id):
+        return
+    
+    try:
+        parts = message.text.split()
+        if len(parts) == 2:
+            target_id = int(parts[1])
+        else:
+            target_id = message.from_user.id
+        
+        user = get_user(target_id)
+        if not user:
+            bot.reply_to(message, "❌ المستخدم غير موجود")
+            return
+        
+        debug_info = f"""
+🐛 <b>تتبع الإحالات للمستخدم {target_id}</b>
+
+📋 <b>المعلومات الأساسية:</b>
+• has_been_referred: {user.get('has_been_referred', False)}
+• active_referral_source: {user.get('active_referral_source')}
+• joined_via_referral: {user.get('joined_via_referral', False)}
+• referral_source: {user.get('referral_source')}
+
+📊 <b>محاولات الدخول:</b>
+{user.get('referral_attempts', {})}
+
+🕒 <b>أول زيارة:</b> {user.get('first_visit_date', 'N/A')}
+
+🔍 <b>للتجربة:</b>
+لو هذا المستخدم دخل على رابط إحالة مرة ثانية، رح يظهر هنا
+        """
+        
+        bot.reply_to(message, debug_info)
+        
+    except Exception as e:
+        bot.reply_to(message, f"❌ خطأ: {e}")
 
 # =============================================
 # 🔧 نظام السيرفر والويب هوك
