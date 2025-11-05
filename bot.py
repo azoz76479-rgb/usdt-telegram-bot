@@ -104,7 +104,10 @@ def get_user(user_id):
                 'vip_level': 0, 'attempts': 3, 'total_earnings': 0.75,
                 'total_deposits': 0.0, 'registration_date': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
                 'last_activity': datetime.now().strftime('%Y-%m-%d %H:%M:%S'), 'last_mining_date': None,
-                'games_played_today': 0, 'has_deposit': 0, 'language': 'ar'
+                'games_played_today': 0, 'has_deposit': 0, 'language': 'ar',
+                'referral_tracking': {},  # 🔐 تتبع الإحالات
+                'joined_via_referral': False,  # 🔐 هل دخل عبر رابط إحالة؟
+                'referral_notification_sent': False  # 🔐 هل تم إرسال إشعار للإحالة؟
             }
             users_collection.insert_one(new_user)
             return new_user
@@ -125,18 +128,87 @@ def handle_referral_system(message):
     try:
         user_id = message.from_user.id
         command_parts = message.text.split()
+        
         if len(command_parts) > 1 and command_parts[1].startswith('ref'):
             try:
                 referrer_id = int(command_parts[1][3:])
+                
+                # 🔒 التحقق من الشروط قبل إضافة الإحالة
                 if referrer_id != user_id:
                     referrer = get_user(referrer_id)
-                    if referrer:
-                        update_user(referrer_id,
-                            balance=referrer['balance'] + 0.50,
-                            total_earnings=referrer['total_earnings'] + 0.50,
-                            referral_count=referrer['referral_count'] + 1,
-                            new_referrals=referrer['new_referrals'] + 1
-                        )
+                    current_user = get_user(user_id)
+                    
+                    # التحقق من أن المستخدم الجديد ليس له سجل مسبق
+                    if referrer and current_user:
+                        # التحقق من أن المستخدم الجديد مسجل حديثاً (ليس لديه نشاط سابق)
+                        user_reg_date = datetime.strptime(current_user['registration_date'].split()[0], '%Y-%m-%d')
+                        days_since_reg = (datetime.now() - user_reg_date).days
+                        
+                        # 🔐 الشروط الجديدة لمنع الاحتيال:
+                        # 1. المستخدم الجديد مسجل منذ أقل من 24 ساعة
+                        # 2. ليس لديه أي رصيد إضافي (غير الرصيد الابتدائي)
+                        # 3. لم يلعب أي ألعاب بعد
+                        # 4. ليس لديه إيداعات
+                        # 5. لم يتم إرسال إشعار سابق لهذه الإحالة
+                        
+                        if (days_since_reg == 0 and 
+                            current_user['balance'] <= 0.75 and  # الرصيد الابتدائي فقط
+                            current_user.get('games_played_today', 0) == 0 and
+                            current_user.get('total_deposits', 0) == 0 and
+                            current_user.get('has_deposit', 0) == 0 and
+                            not current_user.get('referral_notification_sent', False)):
+                            
+                            # 🔒 منع الإحالات المكررة لنفس المستخدم
+                            referral_key = f"ref_{user_id}"
+                            if not referrer.get('referral_tracking', {}).get(referral_key):
+                                
+                                # تحديث تتبع الإحالات
+                                referral_tracking = referrer.get('referral_tracking', {})
+                                referral_tracking[referral_key] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                                
+                                update_user(referrer_id,
+                                    balance=referrer['balance'] + 0.50,
+                                    total_earnings=referrer['total_earnings'] + 0.50,
+                                    referral_count=referrer['referral_count'] + 1,
+                                    new_referrals=referrer['new_referrals'] + 1,
+                                    referral_tracking=referral_tracking
+                                )
+                                
+                                # 🔐 وضع علامة على المستخدم الجديد أنه دخل عبر رابط إحالة
+                                update_user(user_id, 
+                                    joined_via_referral=True,
+                                    referral_notification_sent=True
+                                )
+                                
+                                # 📩 إرسال رسالة للمستخدم الذي قام بالإحالة
+                                try:
+                                    lang = get_user_language(referrer_id)
+                                    if lang == 'ar':
+                                        notification_msg = f"""🎉 <b>تهانينا! لديك إحالة جديدة</b>
+
+👤 <b>تم انضمام مستخدم جديد عبر رابطك:</b>
+🆔 <b>المعرف:</b> <code>{user_id}</code>
+
+💰 <b>تم إضافة 0.50 USDT إلى رصيدك تلقائياً</b>
+👥 <b>إجمالي إحالاتك:</b> {referrer['referral_count'] + 1}
+
+🎯 <b>استمر في مشاركة الرابط لزيادة أرباحك!</b>"""
+                                    else:
+                                        notification_msg = f"""🎉 <b>Congratulations! New referral</b>
+
+👤 <b>New user joined via your link:</b>
+🆔 <b>ID:</b> <code>{user_id}</code>
+
+💰 <b>0.50 USDT automatically added to your balance</b>
+👥 <b>Your total referrals:</b> {referrer['referral_count'] + 1}
+
+🎯 <b>Keep sharing your link to increase earnings!</b>"""
+                                    
+                                    bot.send_message(referrer_id, notification_msg)
+                                    
+                                except Exception as notify_error:
+                                    print(f"❌ Failed to send referral notification: {notify_error}")
+                                
             except ValueError:
                 pass
     except Exception as e:
@@ -311,8 +383,52 @@ def show_main_menu(chat_id, message_id=None, user_id=None):
 def handle_start(message):
     try:
         user_id = message.from_user.id
+        
+        # 🔐 معالجة نظام الإحالات أولاً
         handle_referral_system(message)
-        update_user(user_id, first_name=message.from_user.first_name or "", username=message.from_user.username or "", last_activity=datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+        
+        # تحديث بيانات المستخدم
+        update_user(user_id, 
+                   first_name=message.from_user.first_name or "", 
+                   username=message.from_user.username or "", 
+                   last_activity=datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+        
+        # إرسال رسالة ترحيب خاصة إذا دخل عبر رابط إحالة
+        user_data = get_user(user_id)
+        if user_data.get('joined_via_referral', False) and not user_data.get('referral_welcome_sent', False):
+            lang = get_user_language(user_id)
+            if lang == 'ar':
+                welcome_msg = """🎉 <b>مرحباً بك في البوت!</b>
+
+✅ <b>تم تسجيل دخولك بنجاح عبر رابط الدعوة</b>
+
+💰 <b>لقد حصل صاحب الرابط على مكافأة 0.50 USDT</b>
+
+🚀 <b>الآن يمكنك البدء في:</b>
+• لعب الألعاب وكسب USDT
+• جلب أصدقاء وكسب المزيد
+• ترقية حسابك VIP
+• سحب أرباحك عند استكمال الشروط
+
+🎯 <b>استكشف القائمة الرئيسية للبدء!</b>"""
+            else:
+                welcome_msg = """🎉 <b>Welcome to the bot!</b>
+
+✅ <b>You have successfully joined via referral link</b>
+
+💰 <b>The referrer has received 0.50 USDT bonus</b>
+
+🚀 <b>Now you can start:</b>
+• Playing games and earning USDT
+• Bringing friends and earning more
+• Upgrading your VIP account
+• Withdrawing earnings when conditions met
+
+🎯 <b>Explore the main menu to get started!</b>"""
+            
+            bot.send_message(user_id, welcome_msg)
+            update_user(user_id, referral_welcome_sent=True)
+        
         show_main_menu(message.chat.id, user_id=user_id)
     except Exception as e:
         print(f"❌ Start error: {e}")
@@ -536,6 +652,7 @@ def handle_daily_bonus(call):
 def handle_referral(call):
     try:
         user_id = call.from_user.id
+        user = get_user(user_id)
         referral_link = f"https://t.me/Usdt_Mini1Bot?start=ref{user_id}"
         
         lang = get_user_language(user_id)
