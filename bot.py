@@ -62,7 +62,6 @@ LANGUAGES = {
         'deposit_btn': "💳 إيداع الرصيد",
         'daily_bonus_btn': "🎁 المكافأة اليومية",
         'support_btn': "🆘 الدعم الفني",
-        'refresh_btn': "🔄 تحديث البيانات",
         'back_btn': "🔙 رجوع",
     },
     'en': {
@@ -73,7 +72,6 @@ LANGUAGES = {
         'deposit_btn': "💳 Deposit Balance",
         'daily_bonus_btn': "🎁 Daily Bonus",
         'support_btn': "🆘 Technical Support",
-        'refresh_btn': "🔄 Refresh Data",
         'back_btn': "🔙 Back",
     }
 }
@@ -112,7 +110,12 @@ def get_user(user_id):
                 'first_game_played': False,
                 'referral_verified': False,
                 'has_received_referral': False,
-                'start_count': 0  # 🔥 إضافة جديدة لتتبع عدد مرات الدخول
+                'start_count': 0,
+                # 🔥 الحقول الجديدة لمنع التكرار
+                'has_been_referred': False,
+                'active_referral_source': None,
+                'first_visit_date': None,
+                'referral_attempts': {}
             }
             users_collection.insert_one(new_user)
             return new_user
@@ -129,8 +132,33 @@ def update_user(user_id, **kwargs):
         print(f"❌ Error updating user: {e}")
         return False
 
+def track_referral_attempt(user_id, referrer_id):
+    """🎯 تتبع محاولات الدخول على الروابط"""
+    try:
+        user = get_user(user_id)
+        if not user:
+            return False
+            
+        referral_attempts = user.get('referral_attempts', {})
+        attempt_key = f"attempt_{referrer_id}"
+        
+        current_attempts = referral_attempts.get(attempt_key, 0)
+        
+        if current_attempts >= 1:
+            print(f"🚫 Too many attempts: {user_id} -> {referrer_id} (attempts: {current_attempts})")
+            return False
+            
+        referral_attempts[attempt_key] = current_attempts + 1
+        update_user(user_id, referral_attempts=referral_attempts)
+        
+        return True
+        
+    except Exception as e:
+        print(f"❌ Track attempt error: {e}")
+        return False
+
 def handle_referral_system(message):
-    """🎯 نظام الإحالات المعدل - منع الإحالة الذاتية 100%"""
+    """🎯 النظام النهائي - منع التكرار 100%"""
     try:
         user_id = message.from_user.id
         command_parts = message.text.split()
@@ -139,16 +167,15 @@ def handle_referral_system(message):
             try:
                 referrer_id = int(command_parts[1][3:])
                 
-                # 🔥 الحل 100% - منع الإحالة الذاتية نهائياً
+                # 🔒 منع الإحالة الذاتية
                 if referrer_id == user_id:
                     print(f"🚫 Self-referral blocked: {user_id}")
-                    # إشعار للمستخدم
-                    lang = get_user_language(user_id)
-                    if lang == 'ar':
-                        bot.send_message(user_id, "❌ <b>لا يمكنك تحويل نفسك!</b>\n\nرابط الإحالة مخصص لإرساله لأشخاص آخرين فقط.")
-                    else:
-                        bot.send_message(user_id, "❌ <b>You cannot refer yourself!</b>\n\nReferral link is for sending to other people only.")
-                    return  # وقف التنفيذ
+                    return
+                
+                # 🔥 التحقق من محاولات الدخول
+                if not track_referral_attempt(user_id, referrer_id):
+                    print(f"🚫 Too many attempts blocked: {user_id} -> {referrer_id}")
+                    return
                 
                 referrer = get_user(referrer_id)
                 current_user = get_user(user_id)
@@ -156,48 +183,38 @@ def handle_referral_system(message):
                 if not referrer or not current_user:
                     return
                 
-                # 🔐 الشرط الحاسم: منع الإحالة إذا كان المستخدم قد استقبل إحالة من قبل
-                if current_user.get('has_received_referral', False):
-                    print(f"🚫 User {user_id} already received referral before - BLOCKED")
+                # 🔥 التحقق الحاسم: إذا المستخدم مسجل مسبقاً في نظام الإحالات
+                if current_user.get('has_been_referred', False):
+                    print(f"🚫 User {user_id} already in referral system - BLOCKED")
                     return
                 
-                # 🔐 منع الإحالة إذا كان المستخدم لديه أي نشاط سابق
-                user_reg_date = datetime.strptime(current_user['registration_date'], '%Y-%m-%d %H:%M:%S')
-                time_since_reg = datetime.now() - user_reg_date
-                
-                has_previous_activity = (
-                    current_user.get('games_played_today', 0) > 0 or
-                    current_user.get('total_deposits', 0) > 0 or
-                    current_user.get('balance', 0) > 0.75 or
-                    current_user.get('referral_count', 0) > 0 or
-                    time_since_reg.total_seconds() > 300  # أكثر من 5 دقائق
-                )
-                
-                if has_previous_activity:
-                    print(f"🚫 User {user_id} has previous activity - BLOCKED")
-                    return
-                
-                # 🔒 منع الإحالات المكررة
-                referral_key = f"ref_{user_id}"
+                # 🔒 منع الإحالات المكررة لنفس المُحيل
+                user_referral_key = f"ref_{user_id}"
                 referral_tracking = referrer.get('referral_tracking', {})
                 
-                if referral_tracking.get(referral_key):
+                if referral_tracking.get(user_referral_key):
+                    print(f"🚫 Duplicate referral blocked: {referrer_id} -> {user_id}")
                     return
                 
-                # ✅ تسجيل الإحالة كمعلقة
-                referral_tracking[referral_key] = {
+                # ✅ التسجيل النهائي (مرة واحدة فقط في العمر)
+                referral_tracking[user_referral_key] = {
                     'date': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
                     'new_user_id': user_id,
-                    'status': 'pending_verification'
+                    'status': 'pending_verification',
+                    'unique_id': f"{user_id}_{referrer_id}_{int(time.time())}"
                 }
                 
-                update_user(referrer_id, referral_tracking=referral_tracking)
                 update_user(user_id, 
-                          referral_source=referrer_id, 
+                          has_been_referred=True,
+                          active_referral_source=referrer_id,
+                          first_visit_date=datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                          referral_source=referrer_id,
                           joined_via_referral=True,
                           start_count=current_user.get('start_count', 0) + 1)
                 
-                print(f"✅ Referral pending: {referrer_id} -> {user_id}")
+                update_user(referrer_id, referral_tracking=referral_tracking)
+                
+                print(f"✅ PERMANENT referral registered: {referrer_id} -> {user_id}")
                 
             except Exception as e:
                 print(f"❌ Referral error: {e}")
@@ -223,7 +240,7 @@ def verify_referral_on_first_game(user_id):
         
         can_get_bonus = (
             user.get('games_played_today', 0) >= 1 and
-            time_since_reg.total_seconds() > 60 and  # مضى أكثر من دقيقة
+            time_since_reg.total_seconds() > 60 and
             not user.get('has_received_referral', False) and
             not user.get('referral_verified', False)
         )
@@ -247,7 +264,7 @@ def verify_referral_on_first_game(user_id):
             update_user(user_id,
                 referral_verified=True,
                 referral_notification_sent=True,
-                has_received_referral=True  # 🔐 منع المستقبل
+                has_received_referral=True
             )
             
             # تحديث حالة الإحالة
@@ -352,6 +369,8 @@ def claim_daily_bonus(user_id):
 def show_main_menu(chat_id, message_id=None, user_id=None):
     try:
         if not user_id: return False
+        
+        # 🔄 تحديث تلقائي للبيانات
         user_data = get_user(user_id)
         if not user_data: return False
         
@@ -421,8 +440,7 @@ def show_main_menu(chat_id, message_id=None, user_id=None):
             InlineKeyboardButton(t(user_id, 'daily_bonus_btn'), callback_data="daily_bonus")
         )
         keyboard.add(
-            InlineKeyboardButton(t(user_id, 'support_btn'), url="https://t.me/Trust_wallet_Support_4"),
-            InlineKeyboardButton(t(user_id, 'refresh_btn'), callback_data="refresh_profile")
+            InlineKeyboardButton(t(user_id, 'support_btn'), url="https://t.me/Trust_wallet_Support_4")
         )
         
         if lang == 'ar':
@@ -666,11 +684,6 @@ def handle_language_change(call):
 @bot.callback_query_handler(func=lambda call: call.data == "back_to_profile")
 def back_to_profile(call):
     show_main_menu(call.message.chat.id, call.message.message_id, call.from_user.id)
-
-@bot.callback_query_handler(func=lambda call: call.data == "refresh_profile")
-def refresh_profile(call):
-    show_main_menu(call.message.chat.id, call.message.message_id, call.from_user.id)
-    bot.answer_callback_query(call.id, "✅ تم التحديث" if get_user_language(call.from_user.id) == 'ar' else "✅ Updated")
 
 @bot.callback_query_handler(func=lambda call: call.data == "daily_bonus")
 def handle_daily_bonus(call):
@@ -1166,7 +1179,7 @@ def handle_quickadd(message):
     except Exception as e:
         bot.reply_to(message, f"❌ <b>خطأ:</b> {e}")
 
-# ... (بقية الأكواد الإدارية تبقى كما هي)
+# ... (بقية الأكواد الإدارية)
 
 # =============================================
 # 🔧 نظام السيرفر والويب هوك
